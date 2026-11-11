@@ -309,13 +309,38 @@ elif modulo.startswith("3"):
         cm1, cm2 = st.columns(2)
         cat_h = cm1.selectbox("Factor Categórico (Grupos):", datos.COLS_CUAL, index=2)
         y_h = cm2.selectbox("Variable Respuesta Continua:", datos.COLS_CUANT, index=0)
-        res_m = E.analisis_mixto(df, cat_h, y_h)
-        st.markdown("#### Resultados de las Pruebas de Hipótesis de Homocedasticidad y Comparación de Grupos")
-        st.dataframe(E.formatear_pvalores(E.tabla_pruebas_mixtas(res_m)).style.format(precision=4), use_container_width=True)
-        st.markdown(E.interpretar_mixto(res_m))
-        with st.expander("Ver estadísticas y pruebas de normalidad por grupo + Gráficos Q-Q"):
-            st.dataframe(E.formatear_pvalores(res_m["tabla_grupos"]).style.format(precision=4), use_container_width=True)
-            mostrar_mpl(G.qq_grupos(res_m))
+        grupos_activos = E._grupos(df, cat_h, y_h)
+        if len(grupos_activos) < 2:
+            st.warning(f"Con los filtros actuales de la barra lateral solo queda {len(grupos_activos)} grupo válido en `{cat_h}`. Amplíe los filtros para comparar grupos.")
+        else:
+            res_m = E.analisis_mixto(df, cat_h, y_h)
+            st.markdown("#### Resultados de las Pruebas de Hipótesis de Homocedasticidad y Comparación de Grupos")
+            st.dataframe(E.formatear_pvalores(E.tabla_pruebas_mixtas(res_m)).style.format(precision=4), use_container_width=True)
+
+            st.markdown("#### Tamaños del Efecto: $\\eta^2$ (Eta cuadrado), $\\omega^2$ (Omega cuadrado) y $\\varepsilon^2$ (Épsilon cuadrado)")
+            st.dataframe(
+                E.tabla_tamanos_efecto(res_m).style.format({
+                    "Valor (0–1)": "{:.4f}",
+                    "Porcentaje Explicado (%)": "{:.2f} %",
+                }),
+                use_container_width=True,
+            )
+            ef_min = min(res_m["eta2"], res_m["omega2"], res_m["epsilon2"]) * 100.0
+            ef_max = max(res_m["eta2"], res_m["omega2"], res_m["epsilon2"]) * 100.0
+            st.info(
+                f"**¿Qué significan estos porcentajes?** Con $N = {res_m['N']:,}$ estudiantes, el p-valor (`< 0.0001`) "
+                f"solo confirma que existe diferencia estadística, pero el **tamaño del efecto** mide **qué tan grande e importante** "
+                f"es esa diferencia (de $0$ a $1$, o de $0\\%$ a $100\\%$):\n"
+                f"- Para **`{cat_h}`**, entre un **{ef_min:.2f} %** y un **{ef_max:.2f} %** de toda la variabilidad en **`{y_h}`** "
+                f"se explica únicamente por pertenecer a distintos grupos de esta variable; el porcentaje restante proviene de otros "
+                f"factores (colegio, internet, preparación individual, etc.).\n"
+                f"- **Escala de referencia (Cohen):** $< 1\\%$ despreciable · $1\\%–6\\%$ pequeño · $6\\%–14\\%$ mediano · $\\ge 14\\%$ grande."
+            )
+
+            st.markdown(E.interpretar_mixto(res_m))
+            with st.expander("Ver estadísticas y pruebas de normalidad por grupo + Gráficos Q-Q"):
+                st.dataframe(E.formatear_pvalores(res_m["tabla_grupos"]).style.format(precision=4), use_container_width=True)
+                mostrar_mpl(G.qq_grupos(res_m))
 
     with t_chi:
         cc1, cc2 = st.columns(2)

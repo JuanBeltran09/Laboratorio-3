@@ -587,6 +587,34 @@ def welch_anova(grupos: list[np.ndarray]) -> tuple[float, float, float, float]:
     return F, float(k - 1), df2, float(stats.f.sf(F, k - 1, df2))
 
 
+def _tamanos_efecto_grupos(arrs: list[np.ndarray], H: float) -> tuple[float, float, float]:
+    """Calcula η² (ANOVA), ω² (insesgado) y ε² (Kruskal-Wallis) para k grupos."""
+    k = len(arrs)
+    N = sum(len(a) for a in arrs)
+    todo = np.concatenate(arrs)
+    media_total = todo.mean()
+    sst = float(((todo - media_total) ** 2).sum())
+    ssb = float(sum(len(a) * (a.mean() - media_total) ** 2 for a in arrs))
+    eta2 = ssb / sst if sst > 0 else np.nan
+    msw = (sst - ssb) / (N - k) if (N - k) > 0 else np.nan
+    omega2 = (ssb - (k - 1) * msw) / (sst + msw) if (N - k) > 0 and (sst + msw) > 0 else np.nan
+    eps2 = float((H - k + 1) / (N - k)) if (N - k) > 0 else np.nan
+    return float(eta2), float(omega2), float(eps2)
+
+
+def clasificar_tamano_efecto(v: float) -> str:
+    """Clasifica la magnitud de varianza explicada (η², ω², ε²) según los umbrales de Cohen."""
+    if np.isnan(v):
+        return "No disponible"
+    if v < 0.01:
+        return "Despreciable (< 1 %)"
+    if v < 0.06:
+        return "Pequeño (1 % – 6 %)"
+    if v < 0.14:
+        return "Mediano (6 % – 14 %)"
+    return "Grande (≥ 14 %)"
+
+
 def analisis_mixto(df: pd.DataFrame, cat: str, y: str, semilla: int = 42) -> dict:
     g = _grupos(df, cat, y)
     arrs = list(g.values())
@@ -612,13 +640,7 @@ def analisis_mixto(df: pd.DataFrame, cat: str, y: str, semilla: int = 42) -> dic
     F, p_F = stats.f_oneway(*arrs)
     Fw, gl1w, gl2w, p_w = welch_anova(arrs)
     H, p_H = stats.kruskal(*arrs)
-    todo = np.concatenate(arrs)
-    sst = float(((todo - todo.mean()) ** 2).sum())
-    ssb = float(sum(len(a) * (a.mean() - todo.mean()) ** 2 for a in arrs))
-    eta2 = ssb / sst
-    msw = (sst - ssb) / (N - k)
-    omega2 = (ssb - (k - 1) * msw) / (sst + msw)
-    eps2 = float((H - k + 1) / (N - k))
+    eta2, omega2, eps2 = _tamanos_efecto_grupos(arrs, H)
     return {
         "cat": cat,
         "y": y,
@@ -687,6 +709,42 @@ def tabla_pruebas_mixtas(r: dict) -> pd.DataFrame:
     ]).set_index("prueba")
 
 
+def tabla_tamanos_efecto(r: dict) -> pd.DataFrame:
+    """Tabla resumen con η², ω² y ε², su porcentaje de variabilidad explicada e interpretación."""
+    especificaciones = [
+        (
+            "η² (Eta cuadrado)",
+            "ANOVA de un factor (F)",
+            r["eta2"],
+            "Proporción directa de la variabilidad muestral explicada por el factor (SS_entre / SS_total).",
+        ),
+        (
+            "ω² (Omega cuadrado)",
+            "ANOVA de Welch (F_W)",
+            r["omega2"],
+            "Estimador corregido (menos sesgado) de la varianza explicada en la población.",
+        ),
+        (
+            "ε² (Épsilon cuadrado)",
+            "Kruskal-Wallis (H)",
+            r["epsilon2"],
+            "Equivalente no paramétrico: porcentaje de variación en los rangos explicado por el factor.",
+        ),
+    ]
+    filas = []
+    for metrica, prueba, val, def_tecnica in especificaciones:
+        pct = val * 100.0 if not np.isnan(val) else np.nan
+        filas.append({
+            "Tamaño del Efecto": metrica,
+            "Prueba Asociada": prueba,
+            "Valor (0–1)": val,
+            "Porcentaje Explicado (%)": pct,
+            "Magnitud (Cohen)": clasificar_tamano_efecto(val),
+            "¿Qué mide este porcentaje?": def_tecnica,
+        })
+    return pd.DataFrame(filas).set_index("Tamaño del Efecto")
+
+
 def interpretar_mixto(r: dict) -> str:
     t = r["tabla_grupos"]
     pct_no_normal = 100.0 * (t["p_dagostino"] < 0.05).mean()
@@ -720,13 +778,13 @@ def ranking_asociacion(
     for c in cats:
         g = _grupos(df, c, y)
         arrs = list(g.values())
-        k, N = len(arrs), sum(len(a) for a in arrs)
+        if len(arrs) < 2:
+            continue
+        k = len(arrs)
         F, p_f = stats.f_oneway(*arrs)
         Fw, _, _, p_w = welch_anova(arrs)
         H, p_k = stats.kruskal(*arrs)
-        todo = np.concatenate(arrs)
-        ssb = sum(len(a) * (a.mean() - todo.mean()) ** 2 for a in arrs)
-        eta2 = ssb / ((todo - todo.mean()) ** 2).sum()
+        eta2, omega2, eps2 = _tamanos_efecto_grupos(arrs, H)
         cod = pd.factorize(df[c].astype(str))[0]
         mi = mutual_info_score(cod, ybin)
         ha = _entropia(np.bincount(cod))
@@ -738,8 +796,9 @@ def ranking_asociacion(
             "F_welch": float(Fw),
             "H_kruskal": float(H),
             "p_kruskal": float(p_k),
-            "epsilon2": float((H - k + 1) / (N - k)),
             "eta2": float(eta2),
+            "omega2": float(omega2),
+            "epsilon2": float(eps2),
             "MI_normalizada": float(mi / min(ha, _entropia(np.bincount(ybin)))),
             "dif_medianas": float(max(med.values()) - min(med.values())),
         })
