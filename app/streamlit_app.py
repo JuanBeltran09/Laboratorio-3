@@ -15,6 +15,7 @@ Ejecución desde la terminal:
 """
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -30,6 +31,21 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src import datos, estadistica as E, graficos as G, modelos as M
+
+
+def _asegurar_modulos_actualizados() -> None:
+    """Recarga los submódulos de `src` si cambiaron en disco (evita caché obsoleto en Streamlit Cloud)."""
+    for mod in (datos, E, M, G):
+        ruta = getattr(mod, "__file__", None)
+        if not ruta:
+            continue
+        mtime = Path(ruta).stat().st_mtime
+        if getattr(mod, "_loaded_mtime", None) != mtime:
+            importlib.reload(mod)
+            mod._loaded_mtime = Path(ruta).stat().st_mtime
+
+
+_asegurar_modulos_actualizados()
 
 # ===========================================================================
 # CONFIGURACIÓN DE LA PÁGINA Y ESTILOS
@@ -87,7 +103,8 @@ def cargar_base():
 
 
 @st.cache_resource(show_spinner="Cargando pipelines predictivos (.joblib)…")
-def obtener_modelos():
+def obtener_modelos(sklearn_version: str = M.sklearn.__version__):
+    _ = sklearn_version
     return M.cargar_modelos_guardados()
 
 
@@ -396,7 +413,7 @@ elif modulo.startswith("4"):
         st.markdown(
             """
             ### Estructura Reproducible del `Pipeline` y `ColumnTransformer`
-            Siguiendo las mejores prácticas del curso (Notebooks 7 y 8), el preprocesamiento y el estimador se encapsulan en un único objeto `Pipeline` para impedir cualquier fuga de información (*data leakage*) entre entrenamiento y prueba o durante los 10 pliegues de validación cruzada:
+            Siguiendo las mejores prácticas, el preprocesamiento y el estimador se encapsulan en un único objeto `Pipeline` para impedir cualquier fuga de información (*data leakage*) entre entrenamiento y prueba o durante los 10 pliegues de validación cruzada:
             1. **Rama Categórica (`cat_pipeline`):** `SimpleImputer(strategy='constant', fill_value='Desconocido')` → `OneHotEncoder(drop='first', handle_unknown='ignore')` (codificación *Dummy* $k-1$ que evita la trampa de multicolinealidad perfecta).
             2. **Rama Numérica (`num_pipeline`):** `SimpleImputer(strategy='median')` → `StandardScaler()` ($z = \\frac{x - \\mu}{\\sigma}$, centrando cada variable en media 0 y desviación estándar 1 para hacer directamente comparables sus coeficientes parciales estandarizados).
             """

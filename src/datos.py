@@ -210,7 +210,11 @@ def agregar_variables_derivadas(df: pd.DataFrame) -> pd.DataFrame:
 
 def preparar_entrada_usuario(df_input: pd.DataFrame) -> pd.DataFrame:
     """Transforma un DataFrame con las variables seleccionadas por el usuario en las columnas del Pipeline."""
-    return agregar_variables_derivadas(df_input)
+    out = agregar_variables_derivadas(df_input)
+    for c in set(COLS_CUAL) | set(CAT_COLS_SOCIO):
+        if c in out.columns:
+            out[c] = out[c].astype(object)
+    return out
 
 
 def depurar(crudo: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -236,7 +240,7 @@ def depurar(crudo: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     # Tratamiento de vacíos en cualitativas como categoría explícita 'Desconocido'
     for c in COLS_CUAL:
-        df[c] = df[c].astype(object).where(df[c].notna(), "Desconocido").astype(str).str.strip()
+        df[c] = df[c].astype(object).where(df[c].notna(), "Desconocido").astype(str).str.strip().astype(object)
 
     # Ingeniería de variables derivadas
     df = agregar_variables_derivadas(df)

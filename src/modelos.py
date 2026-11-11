@@ -13,15 +13,19 @@ Implementa la metodología completa de los Notebooks 7, 8 y 9 del curso:
 """
 from __future__ import annotations
 
+import inspect
 import json
+import warnings
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+import sklearn
 from scipy import stats
 from scipy.stats import uniform
 from sklearn.compose import ColumnTransformer
+from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import (
@@ -123,6 +127,25 @@ def construir_pipeline_regresion(
     ])
 
 
+def _usa_l1_ratio_logistica() -> bool:
+    """Detecta si scikit-learn (>= 1.8) deprecó `penalty` en favor de `l1_ratio`."""
+    param = inspect.signature(LogisticRegression.__init__).parameters.get("penalty")
+    return param is None or param.default == "deprecated"
+
+
+def _kwargs_regularizacion_logistica(penalty: str | None, C: float) -> dict:
+    """Devuelve argumentos de regularización compatibles con scikit-learn 1.3–1.8+."""
+    if not _usa_l1_ratio_logistica():
+        return {"penalty": penalty, "C": C}
+    if penalty == "l1":
+        return {"l1_ratio": 1.0, "C": C}
+    if penalty == "l2":
+        return {"l1_ratio": 0.0, "C": C}
+    if penalty == "elasticnet":
+        return {"l1_ratio": 0.5, "C": C}
+    return {"C": np.inf if penalty is None else C}
+
+
 def construir_pipeline_logistica(
     cat_cols: list[str] | None = None,
     num_cols: list[str] | None = None,
@@ -136,17 +159,17 @@ def construir_pipeline_logistica(
 ) -> Pipeline:
     """Pipeline reproducible para Regresión Logística (Clasificación Binaria)."""
     prep = construir_preprocesador(cat_cols, num_cols, categorias_orden, scaler)
+    reg_kwargs = _kwargs_regularizacion_logistica(penalty=penalty, C=C)
     return Pipeline([
         ("preprocessing", prep),
         (
             "model",
             LogisticRegression(
-                C=C,
-                penalty=penalty,
                 solver=solver,
                 class_weight=class_weight,
                 max_iter=1000,
                 random_state=semilla,
+                **reg_kwargs,
             ),
         ),
     ])
@@ -459,9 +482,11 @@ def entrenar_evaluar_logistica(
 
     # 3. Optimización de Hiperparámetros con RandomizedSearchCV (Notebook 9)
     cv_search = StratifiedKFold(n_splits=5, shuffle=True, random_state=semilla)
+    clave_reg_param = "model__l1_ratio" if _usa_l1_ratio_logistica() else "model__penalty"
+    vals_reg_param = [0.0, 1.0] if _usa_l1_ratio_logistica() else ["l1", "l2"]
     param_dist = {
         "model__C": uniform(0.01, 15.0),
-        "model__penalty": ["l1", "l2"],
+        clave_reg_param: vals_reg_param,
         "model__solver": ["liblinear"],
         "model__class_weight": [None, "balanced"],
     }
@@ -554,6 +579,123 @@ def entrenar_evaluar_logistica(
 
 
 # --------------------------------------------------------------------------- 4. Entrenamiento Final y Guardado (.joblib + JSON)
+def _extraer_hiperparametros_logistica(best_params: dict) -> dict:
+    """Normaliza los hiperparámetros guardados de Logística (compatibilidad penalty / l1_ratio)."""
+    if "model__penalty" in best_params:
+        penalty = best_params["model__penalty"]
+    elif "model__l1_ratio" in best_params:
+        penalty = "l1" if float(best_params["model__l1_ratio"]) >= 0.5 else "l2"
+    else:
+        penalty = "l2"
+    return {
+        "C": float(best_params.get("model__C", 1.0)),
+        "penalty": penalty,
+        "solver": best_params.get("model__solver", "liblinear"),
+        "class_weight": best_params.get("model__class_weight", None),
+    }
+
+
+def _ajustar_modelos_produccion(
+    df: pd.DataFrame,
+    bp_socio: dict,
+    bp_acad: dict,
+    guardar_en_disco: bool = True,
+    ignorar_error_disco: bool = False,
+) -> dict:
+    """Ajusta los 4 pipelines finales con el 100 % de los datos usando la versión activa de scikit-learn."""
+    df_fit = df.copy()
+    for col_cat in set(datos.CAT_COLS_SOCIO) | set(datos.CAT_COLS_ACAD):
+        if col_cat in df_fit.columns:
+            df_fit[col_cat] = df_fit[col_cat].astype(object)
+
+    y_reg = df_fit["punt_global"].astype(float)
+    y_log = df_fit["supera_promedio"].astype(int)
+
+    final_reg_socio = construir_pipeline_regresion(datos.CAT_COLS_SOCIO, datos.NUM_COLS_SOCIO)
+    final_reg_socio.fit(df_fit[datos.FEATURES_SOCIO], y_reg)
+
+    final_reg_acad = construir_pipeline_regresion(datos.CAT_COLS_ACAD, datos.NUM_COLS_ACAD)
+    final_reg_acad.fit(df_fit[datos.FEATURES_ACAD], y_reg)
+
+    params_s = _extraer_hiperparametros_logistica(bp_socio)
+    final_log_socio = construir_pipeline_logistica(
+        datos.CAT_COLS_SOCIO, datos.NUM_COLS_SOCIO, **params_s
+    )
+    final_log_socio.fit(df_fit[datos.FEATURES_SOCIO], y_log)
+
+    params_a = _extraer_hiperparametros_logistica(bp_acad)
+    final_log_acad = construir_pipeline_logistica(
+        datos.CAT_COLS_ACAD, datos.NUM_COLS_ACAD, **params_a
+    )
+    final_log_acad.fit(df_fit[datos.FEATURES_ACAD], y_log)
+
+    artefactos = {
+        "reg_socio": final_reg_socio,
+        "features_reg_socio": list(datos.FEATURES_SOCIO),
+        "reg_acad": final_reg_acad,
+        "features_reg_acad": list(datos.FEATURES_ACAD),
+        "log_socio": final_log_socio,
+        "features_log_socio": list(datos.FEATURES_SOCIO),
+        "log_acad": final_log_acad,
+        "features_log_acad": list(datos.FEATURES_ACAD),
+    }
+
+    if guardar_en_disco:
+        try:
+            RUTA_MODELOS.mkdir(parents=True, exist_ok=True)
+            joblib.dump(final_reg_socio, RUTA_MODELOS / "model_linear_regression.joblib")
+            joblib.dump(list(datos.FEATURES_SOCIO), RUTA_MODELOS / "features_linear_regression.joblib")
+            joblib.dump(final_reg_acad, RUTA_MODELOS / "model_linear_academico.joblib")
+            joblib.dump(list(datos.FEATURES_ACAD), RUTA_MODELOS / "features_linear_academico.joblib")
+            joblib.dump(final_log_socio, RUTA_MODELOS / "model_logistic_regression.joblib")
+            joblib.dump(list(datos.FEATURES_SOCIO), RUTA_MODELOS / "features_logistic_regression.joblib")
+            joblib.dump(final_log_acad, RUTA_MODELOS / "model_logistic_academico.joblib")
+            joblib.dump(list(datos.FEATURES_ACAD), RUTA_MODELOS / "features_logistic_academico.joblib")
+        except OSError:
+            if not ignorar_error_disco:
+                raise
+
+    return artefactos
+
+
+def _validar_artefactos_predictivos(artefactos: dict) -> None:
+    """Verifica que los 4 pipelines cargados ejecuten transform y predict sin errores de versión."""
+    df_smoke_raw = pd.DataFrame([
+        {
+            "fami_educacionmadre": "Secundaria (Bachillerato) completa",
+            "fami_estratovivienda": "Estrato 2",
+            "fami_tieneinternet": "Si",
+            "cole_naturaleza": "OFICIAL",
+            "cole_area_ubicacion": "URBANO",
+            "estu_genero": "F",
+            "punt_ingles": 50.0,
+        },
+        {
+            "fami_educacionmadre": "Desconocido",
+            "fami_estratovivienda": "Sin Estrato",
+            "fami_tieneinternet": "Desconocido",
+            "cole_naturaleza": "NO OFICIAL",
+            "cole_area_ubicacion": "RURAL",
+            "estu_genero": "M",
+            "punt_ingles": np.nan,
+        },
+    ])
+    df_smoke = datos.preparar_entrada_usuario(df_smoke_raw)
+
+    for clave_reg, clave_feats in (("reg_socio", "features_reg_socio"), ("reg_acad", "features_reg_acad")):
+        pipe = artefactos[clave_reg]
+        feats = artefactos[clave_feats]
+        prep = pipe.named_steps["preprocessing"]
+        _ = pipe.predict(df_smoke[feats])
+        _ = prep.transform(df_smoke[feats])
+        _ = prep.get_feature_names_out()
+
+    for clave_log, clave_feats in (("log_socio", "features_log_socio"), ("log_acad", "features_log_acad")):
+        pipe = artefactos[clave_log]
+        feats = artefactos[clave_feats]
+        _ = pipe.predict_proba(df_smoke[feats])
+
+
 def entrenar_y_guardar_modelos_finales(df: pd.DataFrame | None = None) -> dict:
     """Entrena los pipelines finales sobre toda la base depurada y los guarda en `models/`."""
     if df is None:
@@ -576,41 +718,13 @@ def entrenar_y_guardar_modelos_finales(df: pd.DataFrame | None = None) -> dict:
     )
 
     # Ajustar modelos finales con el 100 % de los datos para producción en Streamlit
-    final_reg_socio = construir_pipeline_regresion(datos.CAT_COLS_SOCIO, datos.NUM_COLS_SOCIO)
-    final_reg_socio.fit(df[datos.FEATURES_SOCIO], df["punt_global"].astype(float))
-    joblib.dump(final_reg_socio, RUTA_MODELOS / "model_linear_regression.joblib")
-    joblib.dump(datos.FEATURES_SOCIO, RUTA_MODELOS / "features_linear_regression.joblib")
-
-    final_reg_acad = construir_pipeline_regresion(datos.CAT_COLS_ACAD, datos.NUM_COLS_ACAD)
-    final_reg_acad.fit(df[datos.FEATURES_ACAD], df["punt_global"].astype(float))
-    joblib.dump(final_reg_acad, RUTA_MODELOS / "model_linear_academico.joblib")
-    joblib.dump(datos.FEATURES_ACAD, RUTA_MODELOS / "features_linear_academico.joblib")
-
-    bp_s = log_socio["best_params"]
-    final_log_socio = construir_pipeline_logistica(
-        datos.CAT_COLS_SOCIO,
-        datos.NUM_COLS_SOCIO,
-        C=bp_s["model__C"],
-        penalty=bp_s["model__penalty"],
-        solver=bp_s["model__solver"],
-        class_weight=bp_s["model__class_weight"],
+    _ajustar_modelos_produccion(
+        df,
+        log_socio["best_params"],
+        log_acad["best_params"],
+        guardar_en_disco=True,
+        ignorar_error_disco=False,
     )
-    final_log_socio.fit(df[datos.FEATURES_SOCIO], df["supera_promedio"].astype(int))
-    joblib.dump(final_log_socio, RUTA_MODELOS / "model_logistic_regression.joblib")
-    joblib.dump(datos.FEATURES_SOCIO, RUTA_MODELOS / "features_logistic_regression.joblib")
-
-    bp_a = log_acad["best_params"]
-    final_log_acad = construir_pipeline_logistica(
-        datos.CAT_COLS_ACAD,
-        datos.NUM_COLS_ACAD,
-        C=bp_a["model__C"],
-        penalty=bp_a["model__penalty"],
-        solver=bp_a["model__solver"],
-        class_weight=bp_a["model__class_weight"],
-    )
-    final_log_acad.fit(df[datos.FEATURES_ACAD], df["supera_promedio"].astype(int))
-    joblib.dump(final_log_acad, RUTA_MODELOS / "model_logistic_academico.joblib")
-    joblib.dump(datos.FEATURES_ACAD, RUTA_MODELOS / "features_logistic_academico.joblib")
 
     # Guardar resumen JSON para carga instantánea en el dashboard de Streamlit
     resumen_json = {
@@ -679,12 +793,8 @@ def entrenar_y_guardar_modelos_finales(df: pd.DataFrame | None = None) -> dict:
     }
 
 
-def cargar_modelos_guardados() -> dict:
-    """Carga los pipelines `.joblib` y el resumen de métricas desde `models/`."""
-    if not (RUTA_MODELOS / "model_linear_regression.joblib").exists():
-        entrenar_y_guardar_modelos_finales()
-    with open(RUTA_MODELOS / "metricas_resumen.json", encoding="utf-8") as f:
-        resumen = json.load(f)
+def _leer_artefactos_joblib() -> dict:
+    """Carga los 4 pipelines `.joblib` y sus listas de variables desde `models/`."""
     return {
         "reg_socio": joblib.load(RUTA_MODELOS / "model_linear_regression.joblib"),
         "features_reg_socio": joblib.load(RUTA_MODELOS / "features_linear_regression.joblib"),
@@ -694,8 +804,43 @@ def cargar_modelos_guardados() -> dict:
         "features_log_socio": joblib.load(RUTA_MODELOS / "features_logistic_regression.joblib"),
         "log_acad": joblib.load(RUTA_MODELOS / "model_logistic_academico.joblib"),
         "features_log_acad": joblib.load(RUTA_MODELOS / "features_logistic_academico.joblib"),
-        "resumen": resumen,
     }
+
+
+def cargar_modelos_guardados() -> dict:
+    """Carga los pipelines `.joblib` y el resumen de métricas desde `models/`.
+
+    Si los `.joblib` faltan o fueron serializados con otra versión de scikit-learn
+    (p. ej. `SimpleImputer._fill_dtype` en Streamlit Cloud con Python 3.14 / sklearn 1.8+),
+    reajusta automáticamente los 4 pipelines finales en la versión activa (~1 s)
+    preservando los hiperparámetros óptimos de `metricas_resumen.json`.
+    """
+    ruta_resumen = RUTA_MODELOS / "metricas_resumen.json"
+    if not ruta_resumen.exists():
+        entrenar_y_guardar_modelos_finales()
+
+    with open(ruta_resumen, encoding="utf-8") as f:
+        resumen = json.load(f)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", InconsistentVersionWarning)
+            artefactos = _leer_artefactos_joblib()
+        _validar_artefactos_predictivos(artefactos)
+    except Exception:
+        df_dep, _ = datos.cargar_datos()
+        artefactos = _ajustar_modelos_produccion(
+            df_dep,
+            resumen["logistica_socio"]["best_params"],
+            resumen["logistica_acad"]["best_params"],
+            guardar_en_disco=True,
+            ignorar_error_disco=True,
+        )
+        _validar_artefactos_predictivos(artefactos)
+
+    artefactos["resumen"] = resumen
+    artefactos["sklearn_version"] = sklearn.__version__
+    return artefactos
 
 
 if __name__ == "__main__":
